@@ -5,14 +5,19 @@
  * OpenCode's attachment pipeline only forwards text and PNG/JPEG/GIF/WebP to
  * the model, and the OpenAI-chat protocol layer rejects non-image MediaParts.
  * This plugin therefore captures media early (prompt attachments, `read` tool),
- * records the reference in plugin storage WITHOUT touching the message text
- * (so no UI shows any marker), and injects real provider content parts at the
- * last possible moment — the `http.request` hook — by matching the message
- * text against the recorded hashes.
+ * records the reference in the message's own metadata WITHOUT touching the
+ * message text (so no UI shows any marker), and injects real provider content
+ * parts at the last possible moment — the `http.request` hook — by matching
+ * the message text against the recorded hashes.
  *
- *   @-attached media ──┐                          ┌── http.request hook:
- *                       ├─▶ storage[text hash] ──┤   text match → input_audio /
- *   read() on media  ───┘    (message text clean) └──   video_url content parts
+ *   @-attached media ──┐                            ┌── http.request hook:
+ *                       ├─▶ message metadata[text hash] ──┤   text match → input_audio /
+ *   read() on media  ───┘    (message text clean)   └──   video_url content parts
+ *
+ * The messages themselves are the durable record: user messages carry the refs
+ * in their admission metadata, tool results in their tool-state metadata. The
+ * plugin owns no storage; a per-session map is rebuilt from the session's own
+ * messages on first touch, so injection survives service restarts.
  *
  * Explicit <opencode-media .../> markers in message text are still honored
  * (handy for tests and manual use) but are no longer generated here.
@@ -27,7 +32,6 @@ import {
   hasMarker,
   isNativeImage,
   markerNote,
-  NOTE_PREFIX,
   shouldInject,
   sniffMime,
   splitSegments,
@@ -198,25 +202,84 @@ export default Plugin.define({
 
     // ------------------------------------------------------------------
     // The invisible seam: text hash → media refs
-    //   m/<sessionID>/<hash> — user messages (prompt attachments)
-    //   r/<hash>             — read tool results (same file → same note)
+    //   m/<hash> — user messages (prompt attachments)
+    //   r/<hash> — read tool results (same file → same note)
+    //
+    // No plugin-owned storage: the durable record rides on the messages
+    // themselves (user message metadata / tool-state metadata), and this map
+    // is rebuilt from a session's own messages on first touch — so injection
+    // survives service restarts without keeping state anywhere else.
     // ------------------------------------------------------------------
 
-    async function record(key: string, ref: MediaRef): Promise<void> {
-      const existing = (await ctx.storage.get(key)) as MediaRef[] | undefined
-      const refs = Array.isArray(existing) ? existing : []
-      if (refs.some((r) => r.uri === ref.uri)) return
-      refs.push(ref)
-      await ctx.storage.set(key, refs as unknown as Parameters<typeof ctx.storage.set>[1])
+    const META_KEY = "opencode-media"
+    type RefMap = Map<string, MediaRef[]>
+    const seams = new Map<string, { map: RefMap; ready: Promise<void> }>()
+
+    /** Normalize a metadata value into refs (tolerates a single ref). */
+    function refsFromMeta(value: unknown): MediaRef[] {
+      const out: MediaRef[] = []
+      const take = (v: unknown) => {
+        const ref = v as Partial<MediaRef> | null
+        if (ref && typeof ref === "object" && typeof ref.uri === "string" && typeof ref.mime === "string")
+          out.push({ uri: ref.uri, mime: ref.mime, name: ref.name, bytes: ref.bytes })
+      }
+      if (Array.isArray(value)) for (const v of value) take(v)
+      else take(value)
+      return out
+    }
+
+    /** Merge refs into one map key, deduped by URI. */
+    function addRefs(map: RefMap, key: string, refs: readonly MediaRef[]): void {
+      if (refs.length === 0) return
+      const list = map.get(key) ?? []
+      for (const ref of refs) if (!list.some((r) => r.uri === ref.uri)) list.push(ref)
+      map.set(key, list)
+    }
+
+    /** Rebuild one session's map from its messages' own metadata. */
+    async function hydrate(sessionID: string, map: RefMap): Promise<void> {
+      try {
+        for (const message of await ctx.session.context({ sessionID })) {
+          if (message.type === "user") {
+            addRefs(map, `m/${sha(message.text)}`, refsFromMeta(message.metadata?.[META_KEY]))
+            continue
+          }
+          if (message.type !== "assistant") continue
+          for (const part of message.content) {
+            if (part.type !== "tool" || part.state.status !== "completed") continue
+            const refs = refsFromMeta(part.state.metadata?.[META_KEY])
+            for (const item of part.state.content ?? []) {
+              if (item.type === "text") addRefs(map, `r/${sha(item.text)}`, refs)
+            }
+          }
+        }
+        dbg("seam map hydrated for", sessionID, `${map.size} keys`)
+      } catch (err) {
+        dbg("session context read failed", sessionID, String(err))
+      }
+    }
+
+    /** The session's seam map, hydrated from its own messages on first touch. */
+    async function sessionMap(sessionID: string): Promise<RefMap> {
+      let seam = seams.get(sessionID)
+      if (!seam) {
+        const map: RefMap = new Map()
+        seam = { map, ready: Promise.resolve() }
+        seams.set(sessionID, seam)
+        seam.ready = hydrate(sessionID, map)
+      }
+      await seam.ready
+      return seam.map
+    }
+
+    async function record(sessionID: string, key: string, ref: MediaRef): Promise<void> {
+      addRefs(await sessionMap(sessionID), key, [ref])
     }
 
     async function lookup(sessionID: string, text: string): Promise<MediaRef[] | undefined> {
+      const map = await sessionMap(sessionID)
       const hash = sha(text)
-      for (const key of [`m/${sessionID}/${hash}`, `r/${hash}`]) {
-        const value = (await ctx.storage.get(key)) as MediaRef[] | undefined
-        if (Array.isArray(value) && value.length > 0) return value
-      }
-      return undefined
+      return map.get(`m/${hash}`) ?? map.get(`r/${hash}`)
     }
 
     /**
@@ -265,26 +328,25 @@ export default Plugin.define({
       }
       if (captured.length === 0) return
       // Leave the message text untouched (no visible markers, mention offsets
-      // stay valid); the media refs are recorded against the exact text.
+      // stay valid); the media refs ride on the message's own admission
+      // metadata (persisted as the user message's metadata).
       event.prompt.files = keep
-      const key = `m/${event.sessionID}/${sha(event.prompt.text)}`
-      for (const ref of captured) await record(key, ref)
+      const key = `m/${sha(event.prompt.text)}`
+      for (const ref of captured) await record(event.sessionID, key, ref)
+      const metadata = (event.metadata ?? {}) as Record<string, unknown>
+      const riding = refsFromMeta(metadata[META_KEY])
+      for (const ref of captured) if (!riding.some((r) => r.uri === ref.uri)) riding.push(ref)
+      metadata[META_KEY] = riding
+      event.metadata = metadata
     })
 
     // ------------------------------------------------------------------
-    // 1b. Tell the model that attached media is real and perceivable
+    // 1b. Advertise media support in the read tool's description
     // ------------------------------------------------------------------
 
-    const MEDIA_SYSTEM_HINT =
-      "Media referenced in this conversation is attached to your messages " +
-      "as real media content parts (input_audio / video_url). Your audio and video encoders process these " +
-      "directly: you genuinely perceive them, even though your text view may show only a placeholder " +
-      "character or tag. Never claim you cannot hear or see an attached media part and never suggest " +
-      "waveform or spectrogram analysis instead — just report what you perceive."
-
     await ctx.session.hook("context", async (event) => {
-      // Advertise media support in the read tool's description — per request,
-      // so the wording matches what the active model can really perceive.
+      // Per request, so the wording matches what the active model can
+      // really perceive.
       const caps = await inputCaps(event.model.providerID, event.model.id)
       const readTool = event.tools.read
       if (readTool) {
@@ -296,11 +358,6 @@ export default Plugin.define({
           dbg("read description extended for", event.model.id, kinds)
         }
       }
-      const snapshot = JSON.stringify(event.messages)
-      const stored = await ctx.storage.scan({ prefix: `m/${event.sessionID}/`, limit: 1 })
-      if (!snapshot.includes("<opencode-media") && !snapshot.includes(NOTE_PREFIX) && stored.entries.length === 0) return
-      event.system.push({ type: "text", text: MEDIA_SYSTEM_HINT })
-      dbg("system media hint added for", event.agent)
     })
 
     // ------------------------------------------------------------------
@@ -327,7 +384,7 @@ export default Plugin.define({
             // is recorded against the note text for request-time injection, and
             // the result mirrors a text-file output to satisfy read's schema.
             const note = markerNote(ref)
-            await record(`r/${sha(note)}`, ref)
+            await record(toolCtx.sessionID, `r/${sha(note)}`, ref)
             return {
               output: {
                 type: "file",
@@ -338,7 +395,9 @@ export default Plugin.define({
                 mime: "text/plain",
               },
               content: note,
-              metadata: { "opencode-media": ref.mime },
+              // The tool state persists this metadata (but not the file
+              // output), so the ref rides here for request-time injection.
+              metadata: { [META_KEY]: [ref] },
             }
           }
           const result = await original(input, toolCtx)

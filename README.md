@@ -19,26 +19,29 @@ Media is captured early and recorded **outside the message text** (so no UI ever
 then injected as real provider content parts at the last possible moment:
 
 ```
-@-attached media ──┐                          ┌── http.request hook:
-                   ├─▶ storage[text hash] ──┤   text match → input_audio /
-read() on media ───┘    (message text clean) └──   video_url content parts
+@-attached media ──┐                                ┌── http.request hook:
+                   ├─▶ message metadata[text hash] ──┤   text match → input_audio /
+read() on media ───┘    (message text clean)         └──   video_url content parts
 ```
 
-1. **`session.hook("prompt")`** — media attachments that OpenCode would drop are recorded in the
-   plugin's durable storage under `m/<sessionID>/<sha256(text)>` and removed from `files`. The
+1. **`session.hook("prompt")`** — media attachments that OpenCode would drop are removed from `files`
+   and their refs recorded in the message's own admission metadata (`metadata["opencode-media"]`,
+   persisted as the user message's metadata) under `m/<sha256(text)>`. The
    message text is never modified: no visible tags, mention offsets stay valid. This also avoids
    the 20 MiB attachment limit being applied to media that would never be sent anyway.
 2. **`ctx.tool.transform("read")`** — the built-in `read` is wrapped: media files return a short
-   note like `[media: clip.wav (audio/wav, 12.5 KB)]` and the ref is recorded under
-   `r/<sha256(note)>`; text and images pass through untouched.
+   note like `[media: clip.wav (audio/wav, 12.5 KB)]` and the ref rides in the tool result's
+   metadata (persisted in the tool state) under `r/<sha256(note)>`; text and images pass through
+   untouched.
 3. **`session.hook("http.request")`** — every outgoing model request is matched message-by-message
    against the recorded hashes (exact text, individual parts, and joined-part fallbacks). Matching
    media is spliced in as native content parts; the text itself is left as-is. A `context` hook
-   adds a system hint so the model trusts its perception instead of claiming it "cannot hear"
-   (multimodal chat templates often show a placeholder character in the text view).
+   extends the `read` tool's description with the modalities the active model can actually
+   perceive.
 
 Because injection happens at request time, raw bytes are only loaded per request (with a small
-mtime-keyed cache), and recording in durable storage means injection survives service restarts.
+mtime-keyed cache). The messages themselves are the durable record — the plugin keeps no storage
+of its own — so injection survives service restarts and follows forks, revert, and compaction.
 
 Explicit `<opencode-media uri="..." mime="..." name="..."/>` markers in message text are still
 honored (useful for tests and manual prompts) but are **no longer generated** by the plugin.
@@ -102,7 +105,8 @@ When a modality is gated, the model sees `[media: file (mime, size)] — not del
 ## Notes & limits
 
 - **No visible markers**: message text and tool output stay clean; the media ↔ message association
-  lives in plugin storage keyed by text hash (`m/<sessionID>/<hash>`, `r/<hash>`).
+  lives in the messages' own metadata (`metadata["opencode-media"]`), keyed in memory by text
+  hash (`m/<hash>`, `r/<hash>`) and rebuilt from the session's messages after a restart.
 - Audio format strings are derived from MIME (`wav`, `mp3`, `flac`, `ogg`, `aac`, `m4a`, ...);
   the serving stack must accept them (vLLM accepts wav/mp3 at minimum).
 - PDFs and other documents are not injected yet (a note is shown instead).
@@ -110,7 +114,8 @@ When a modality is gated, the model sees `[media: file (mime, size)] — not del
 - Explicit markers remain supported and parsing is tolerant of `\"`-escaped quotes; attribute
   values percent-escape `%`, `"`, `\`, `<`, `>`.
 - For best results ask focused questions ("is this a tone or noise?"); purely subjective "describe
-  what you hear" prompts can still trigger hedging in some models despite the system hint.
+  what you hear" prompts can still trigger hedging in some models. The plugin deliberately adds no
+  system-prompt coaching — how the model reports its perception is the model's own behaviour.
 
 ## Development
 
