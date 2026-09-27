@@ -283,6 +283,24 @@ export default Plugin.define({
       "waveform or spectrogram analysis instead — just report what you perceive."
 
     await ctx.session.hook("context", async (event) => {
+      // Advertise media support in the read tool's description — per request,
+      // so the wording matches what the active model can really perceive.
+      const caps = await inputCaps(event.model.providerID, event.model.id)
+      const readTool = event.tools.read
+      if (readTool) {
+        const audioOk = shouldInject(caps, "audio/wav", capabilityGate)
+        const videoOk = shouldInject(caps, "video/mp4", capabilityGate)
+        const kinds = [audioOk ? "audio" : undefined, videoOk ? "video" : undefined].filter(Boolean).join(" and ")
+        if (kinds) {
+          readTool.description =
+            readTool.description +
+            `\n\nMedia support (opencode-media plugin): ${kinds} files are also supported. ` +
+            `Reading one attaches the real ${kinds.replaceAll(" and ", "/")} content to your messages ` +
+            `as native media parts (${partOpts.audio} / ${partOpts.video}) that your encoders perceive directly — ` +
+            `no transcription, waveform, or spectrogram analysis needed.`
+          dbg("read description extended for", event.model.id, kinds)
+        }
+      }
       const snapshot = JSON.stringify(event.messages)
       const stored = await ctx.storage.scan({ prefix: `m/${event.sessionID}/`, limit: 1 })
       if (!snapshot.includes("<opencode-media") && !snapshot.includes(NOTE_PREFIX) && stored.entries.length === 0) return
