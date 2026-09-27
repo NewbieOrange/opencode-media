@@ -1,0 +1,118 @@
+# opencode-media
+
+OpenCode V2 plugin that delivers **audio and video** (and other non-image binaries) to media-capable
+models — through `@`-file attachments *and* the `read` tool.
+
+Verified end-to-end against a self-hosted MiMo V2.6 (vLLM/OpenAI-compatible): audio as
+`input_audio`, video as `video_url` with data URLs.
+
+## Why a plugin is needed
+
+- OpenCode's attachment pipeline only forwards **text and PNG/JPEG/GIF/WebP** to the model;
+  audio/video/PDF binaries are silently dropped before the request is built.
+- The OpenAI-chat protocol layer rejects non-image media parts, so media cannot travel through the
+  typed message layer either.
+
+## How it works
+
+Media is captured early and recorded **outside the message text** (so no UI ever shows a marker),
+then injected as real provider content parts at the last possible moment:
+
+```
+@-attached media ──┐                          ┌── http.request hook:
+                   ├─▶ storage[text hash] ──┤   text match → input_audio /
+read() on media ───┘    (message text clean) └──   video_url content parts
+```
+
+1. **`session.hook("prompt")`** — media attachments that OpenCode would drop are recorded in the
+   plugin's durable storage under `m/<sessionID>/<sha256(text)>` and removed from `files`. The
+   message text is never modified: no visible tags, mention offsets stay valid. This also avoids
+   the 20 MiB attachment limit being applied to media that would never be sent anyway.
+2. **`ctx.tool.transform("read")`** — the built-in `read` is wrapped: media files return a short
+   note like `[media: clip.wav (audio/wav, 12.5 KB)]` and the ref is recorded under
+   `r/<sha256(note)>`; text and images pass through untouched.
+3. **`session.hook("http.request")`** — every outgoing model request is matched message-by-message
+   against the recorded hashes (exact text, individual parts, and joined-part fallbacks). Matching
+   media is spliced in as native content parts; the text itself is left as-is. A `context` hook
+   adds a system hint so the model trusts its perception instead of claiming it "cannot hear"
+   (multimodal chat templates often show a placeholder character in the text view).
+
+Because injection happens at request time, raw bytes are only loaded per request (with a small
+mtime-keyed cache), and recording in durable storage means injection survives service restarts.
+
+Explicit `<opencode-media uri="..." mime="..." name="..."/>` markers in message text are still
+honored (useful for tests and manual prompts) but are **no longer generated** by the plugin.
+
+## Install
+
+Add the package to `opencode.json(c)` in your project (or global) config:
+
+```jsonc
+{
+  "plugins": ["opencode-media"],
+}
+```
+
+For local development, reference a checkout instead — plugins under `.opencode/plugins/`
+are also loaded automatically:
+
+```jsonc
+{
+  "plugins": ["/path/to/opencode-media"],
+}
+```
+
+## Options
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "opencode-media",
+      "options": {
+        "audio": "input_audio",       // or "audio_url"
+        "video": "video_url",
+        "maxBytes": 26214400,         // per media item (raw bytes)
+        "maxPerRequest": 16,
+        "audioTemplate": null,        // custom JSON part: {data} {dataurl} {mime} {format} {name}
+        "videoTemplate": null,
+        "capabilityGate": "strict",   // "strict" | "auto" | "off" (see below)
+        "debug": false,               // log hook activity to /tmp/opencode/media-plugin.log
+      },
+    },
+  ],
+}
+```
+
+### Capability gating
+
+Injection is checked against the model config's `capabilities.input`:
+
+| Mode | Behavior |
+| --- | --- |
+| `strict` (default) | Require the exact modality entry (`audio` for audio, `video` for video). Unknown/missing capabilities block injection. |
+| `auto` | Inject unless the model confidently declares text-only input. Configs that under-declare (e.g. working audio missing from `input`) keep working. |
+| `off` | Always inject; server errors surface naturally. |
+
+When a modality is gated, the model sees `[media: file (mime, size)] — not delivered: model config declares no audio input` instead of the content part. If you use `strict`, declare what your endpoint really supports, e.g. `"capabilities": { "input": ["text", "image", "audio", "video"] }`.
+
+## Notes & limits
+
+- **No visible markers**: message text and tool output stay clean; the media ↔ message association
+  lives in plugin storage keyed by text hash (`m/<sessionID>/<hash>`, `r/<hash>`).
+- Audio format strings are derived from MIME (`wav`, `mp3`, `flac`, `ogg`, `aac`, `m4a`, ...);
+  the serving stack must accept them (vLLM accepts wav/mp3 at minimum).
+- PDFs and other documents are not injected yet (a note is shown instead).
+- Native images (PNG/JPEG/GIF/WebP) are deliberately left to OpenCode's own pipeline.
+- Explicit markers remain supported and parsing is tolerant of `\"`-escaped quotes; attribute
+  values percent-escape `%`, `"`, `\`, `<`, `>`.
+- For best results ask focused questions ("is this a tone or noise?"); purely subjective "describe
+  what you hear" prompts can still trigger hedging in some models despite the system hint.
+
+## Development
+
+Pure logic (sniffing, markers, part mapping) lives in `media.ts` and is covered by `test.ts`:
+
+```sh
+npx -y tsx test.ts
+```
