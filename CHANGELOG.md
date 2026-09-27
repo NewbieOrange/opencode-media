@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-09-27
+
+- **Image-style media snapshots**: media bytes are captured once, when the media
+  enters the conversation (prompt attachment or `read`), and persisted as base64
+  `data` in the message's own metadata — mirroring how OpenCode stores image
+  attachments. Injection reads the snapshot instead of re-reading the disk, so
+  changed or deleted source files can no longer alter or break history.
+  0.2.x URI-only records are still honored via the old disk path (mtime-keyed
+  cache).
+- **Message-scoped injection**: seam keys now hold one occurrence group per
+  media-bearing message, and request-time matching is occurrence-aligned
+  (suffix-aligned for truncated context windows). Two messages with the same
+  text no longer receive each other's media — the likely cause of video parts
+  being re-injected into later image-only turns ("server keeps prefilling").
+
 ## 0.2.0 — 2026-09-27
 
 - **Message-derived refs — plugin storage dropped**: the media ↔ message

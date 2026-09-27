@@ -8,12 +8,70 @@
 export type MediaKind = "audio" | "video" | "binary"
 
 export interface MediaRef {
-  /** file: URL, absolute path, or data: URL. */
+  /** file: URL, absolute path, or data: URL. Provenance only — never re-read once `data` is set. */
   uri: string
   mime: string
   name?: string
   /** Raw byte size, when known. */
   bytes?: number
+  /**
+   * Base64 snapshot of the raw bytes, captured when the media entered the
+   * conversation — mirroring how OpenCode stores image attachments (the
+   * message holds the bytes it admitted). Later edits to, or deletion of,
+   * the source file never change what the model sees.
+   */
+  data?: string
+}
+
+/** Normalize a metadata value into a MediaRef (returns undefined for garbage). */
+export function normalizeRef(value: unknown): MediaRef | undefined {
+  const ref = value as Partial<MediaRef> | null | undefined
+  if (!ref || typeof ref !== "object") return undefined
+  if (typeof ref.uri !== "string" || typeof ref.mime !== "string") return undefined
+  const out: MediaRef = { uri: ref.uri, mime: ref.mime }
+  if (typeof ref.name === "string") out.name = ref.name
+  if (typeof ref.bytes === "number") out.bytes = ref.bytes
+  if (typeof ref.data === "string" && ref.data.length > 0) out.data = ref.data
+  return out
+}
+
+/** Normalize a metadata value into refs (tolerates a single ref, skips junk). */
+export function refsFromMetaValue(value: unknown): MediaRef[] {
+  const out: MediaRef[] = []
+  const take = (v: unknown) => {
+    const ref = normalizeRef(v)
+    if (ref) out.push(ref)
+  }
+  if (Array.isArray(value)) for (const v of value) take(v)
+  else take(value)
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Occurrence groups
+// ---------------------------------------------------------------------------
+
+/**
+ * One media-bearing message per key becomes one group (its refs, in order).
+ * Distinct messages that share a text hash each get their own group, so
+ * injection can stay message-scoped the way OpenCode's image attachments are.
+ */
+export type RefGroups = MediaRef[][]
+
+/** Append one message's refs as a new occurrence group. */
+export function pushGroup(groups: RefGroups, refs: readonly MediaRef[]): void {
+  if (refs.length === 0) return
+  groups.push(refs.map((r) => ({ ...r })))
+}
+
+/**
+ * Pick the group for the `index`-th of `occurrences` same-key slots in one
+ * outgoing request. Slots are suffix-aligned onto groups: context truncation
+ * drops the oldest messages first, so the request's slots correspond to the
+ * LAST groups recorded.
+ */
+export function pickGroup<T>(groups: readonly T[], index: number, occurrences: number): T | undefined {
+  return groups[groups.length - occurrences + index]
 }
 
 export function kindOf(mime: string): MediaKind {

@@ -121,4 +121,28 @@ assert.equal(shouldInject(["text"], "video/mp4", "auto"), false)
 assert.equal(shouldInject(undefined, "audio/wav", "auto"), true) // unknown allowed
 assert.equal(shouldInject([], "audio/wav", "auto"), false) // empty list = text-only
 
+// --- ref metadata (OpenCode image-style snapshots) -------------------------
+import { normalizeRef, pickGroup, pushGroup, refsFromMetaValue, type MediaRef } from "../src/media"
+
+const snap = normalizeRef({ uri: "file:///v.mp4", mime: "video/mp4", name: "v.mp4", bytes: 4, data: "AAAA" })
+assert.deepEqual(snap, { uri: "file:///v.mp4", mime: "video/mp4", name: "v.mp4", bytes: 4, data: "AAAA" })
+assert.equal(normalizeRef({ uri: "file:///v.mp4", mime: "video/mp4", data: "" })?.data, undefined) // empty snapshot dropped
+assert.equal(normalizeRef({ uri: "file:///v.mp4" }), undefined) // mime required
+assert.equal(normalizeRef("junk"), undefined)
+assert.deepEqual(refsFromMetaValue([snap, null, { nope: 1 }]), [snap]) // junk skipped
+assert.deepEqual(refsFromMetaValue(snap), [snap]) // single ref tolerated
+
+// --- occurrence groups -----------------------------------------------------
+const groups: MediaRef[][] = []
+pushGroup(groups, [snap!])
+pushGroup(groups, [snap!])
+assert.equal(groups.length, 2) // two same-text messages = two groups
+pushGroup(groups, [])
+assert.equal(groups.length, 2) // empty refs never create a group
+
+assert.deepEqual(pickGroup(groups, 0, 2), groups[0]) // occurrence-aligned
+assert.deepEqual(pickGroup(groups, 1, 2), groups[1])
+assert.deepEqual(pickGroup(groups, 0, 1), groups[1]) // truncated window: suffix-aligned
+assert.equal(pickGroup(groups, 1, 1), undefined)
+
 console.log("all media.ts tests passed")

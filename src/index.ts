@@ -5,10 +5,13 @@
  * OpenCode's attachment pipeline only forwards text and PNG/JPEG/GIF/WebP to
  * the model, and the OpenAI-chat protocol layer rejects non-image MediaParts.
  * This plugin therefore captures media early (prompt attachments, `read` tool),
- * records the reference in the message's own metadata WITHOUT touching the
+ * SNAPSHOTS ITS BYTES (OpenCode's image-attachment semantics: the message
+ * stores what it admitted, so changed files never rewrite history), records
+ * the reference in the message's own metadata WITHOUT touching the
  * message text (so no UI shows any marker), and injects real provider content
  * parts at the last possible moment — the `http.request` hook — by matching
- * the message text against the recorded hashes.
+ * the message text against the recorded hashes (occurrence-aligned per
+ * message, so shared texts never cross-attach media).
  *
  *   @-attached media ──┐                            ┌── http.request hook:
  *                       ├─▶ message metadata[text hash] ──┤   text match → input_audio /
@@ -32,6 +35,9 @@ import {
   hasMarker,
   isNativeImage,
   markerNote,
+  pickGroup,
+  pushGroup,
+  refsFromMetaValue,
   shouldInject,
   sniffMime,
   splitSegments,
@@ -39,6 +45,7 @@ import {
   type CapabilityGate,
   type MediaRef,
   type PartOptions,
+  type RefGroups,
 } from "./media"
 
 interface Options {
@@ -156,8 +163,13 @@ export default Plugin.define({
       }
     }
 
-    /** Load a media item as base64, enforcing the size limit. */
+    /**
+     * Load a media item as base64, enforcing the size limit. Snapshotted refs
+     * (normal case) return their stored bytes without touching the disk; refs
+     * recorded by older versions fall back to reading the file.
+     */
     function loadBase64(ref: MediaRef): { b64: string } | { error: string } {
+      if (ref.data) return { b64: ref.data }
       try {
         if (ref.uri.startsWith("data:")) {
           const m = /^data:[^,]*,(.*)$/s.exec(ref.uri)
@@ -176,6 +188,17 @@ export default Plugin.define({
       } catch (err) {
         return { error: `unreadable (${err instanceof Error ? err.message : String(err)})` }
       }
+    }
+
+    /**
+     * Snapshot a ref's bytes at capture time — OpenCode's image semantics: the
+     * message stores the bytes it admitted, so changed or deleted source files
+     * never alter what the model sees. Oversized or unreadable refs stay
+     * data-less and fall back to the request-time explanatory note.
+     */
+    function snapshot(ref: MediaRef): MediaRef {
+      const loaded = loadBase64(ref)
+      return "error" in loaded ? ref : { ...ref, data: loaded.b64 }
     }
 
     /** Turn one MediaRef into provider content parts (or an explanatory text part). */
@@ -209,31 +232,25 @@ export default Plugin.define({
     // themselves (user message metadata / tool-state metadata), and this map
     // is rebuilt from a session's own messages on first touch — so injection
     // survives service restarts without keeping state anywhere else.
+    //
+    // Each media-bearing message contributes its own occurrence group per
+    // key, keeping injection message-scoped (like OpenCode's image
+    // attachments, which live inside their message) even when two messages
+    // share the same text. Hydration never observes the message currently
+    // being recorded (admission/tool state persist after the hook returns),
+    // so a message cannot contribute two groups.
     // ------------------------------------------------------------------
 
     const META_KEY = "opencode-media"
-    type RefMap = Map<string, MediaRef[]>
+    type RefMap = Map<string, RefGroups>
     const seams = new Map<string, { map: RefMap; ready: Promise<void> }>()
 
-    /** Normalize a metadata value into refs (tolerates a single ref). */
-    function refsFromMeta(value: unknown): MediaRef[] {
-      const out: MediaRef[] = []
-      const take = (v: unknown) => {
-        const ref = v as Partial<MediaRef> | null
-        if (ref && typeof ref === "object" && typeof ref.uri === "string" && typeof ref.mime === "string")
-          out.push({ uri: ref.uri, mime: ref.mime, name: ref.name, bytes: ref.bytes })
-      }
-      if (Array.isArray(value)) for (const v of value) take(v)
-      else take(value)
-      return out
-    }
-
-    /** Merge refs into one map key, deduped by URI. */
-    function addRefs(map: RefMap, key: string, refs: readonly MediaRef[]): void {
+    /** Append one message's refs as a new occurrence group under `key`. */
+    function addGroup(map: RefMap, key: string, refs: readonly MediaRef[]): void {
       if (refs.length === 0) return
-      const list = map.get(key) ?? []
-      for (const ref of refs) if (!list.some((r) => r.uri === ref.uri)) list.push(ref)
-      map.set(key, list)
+      const groups = map.get(key) ?? []
+      map.set(key, groups)
+      pushGroup(groups, refs)
     }
 
     /** Rebuild one session's map from its messages' own metadata. */
@@ -241,16 +258,21 @@ export default Plugin.define({
       try {
         for (const message of await ctx.session.context({ sessionID })) {
           if (message.type === "user") {
-            addRefs(map, `m/${sha(message.text)}`, refsFromMeta(message.metadata?.[META_KEY]))
+            addGroup(map, `m/${sha(message.text)}`, refsFromMetaValue(message.metadata?.[META_KEY]))
             continue
           }
           if (message.type !== "assistant") continue
           for (const part of message.content) {
             if (part.type !== "tool" || part.state.status !== "completed") continue
-            const refs = refsFromMeta(part.state.metadata?.[META_KEY])
+            const refs = refsFromMetaValue(part.state.metadata?.[META_KEY])
+            if (refs.length === 0) continue
+            // One group per (tool call, key): identical text items in one
+            // result must not split the call's media across groups.
+            const keys = new Set<string>()
             for (const item of part.state.content ?? []) {
-              if (item.type === "text") addRefs(map, `r/${sha(item.text)}`, refs)
+              if (item.type === "text") keys.add(`r/${sha(item.text)}`)
             }
+            for (const key of keys) addGroup(map, key, refs)
           }
         }
         dbg("seam map hydrated for", sessionID, `${map.size} keys`)
@@ -272,40 +294,33 @@ export default Plugin.define({
       return seam.map
     }
 
-    async function record(sessionID: string, key: string, ref: MediaRef): Promise<void> {
-      addRefs(await sessionMap(sessionID), key, [ref])
+    async function record(sessionID: string, key: string, refs: readonly MediaRef[]): Promise<void> {
+      addGroup(await sessionMap(sessionID), key, refs)
     }
 
-    async function lookup(sessionID: string, text: string): Promise<MediaRef[] | undefined> {
-      const map = await sessionMap(sessionID)
+    /** The seam key a text run resolves to (`m/` preferred over `r/`), if any. */
+    function keyFor(map: RefMap, text: string): string | undefined {
       const hash = sha(text)
-      return map.get(`m/${hash}`) ?? map.get(`r/${hash}`)
+      if (map.has(`m/${hash}`)) return `m/${hash}`
+      if (map.has(`r/${hash}`)) return `r/${hash}`
+      return undefined
     }
 
     /**
-     * Expand one text run into content parts. Handles legacy explicit markers
-     * and hash-registered media; returns undefined when nothing applies.
+     * Expand a legacy explicit-marker text run into content parts (hash-
+     * registered media is resolved per message elsewhere); the marker tags
+     * themselves are dropped.
      */
-    async function expand(
-      text: string,
-      budget: { left: number },
-      sessionID: string,
-      caps: readonly string[] | undefined,
-    ): Promise<unknown[] | undefined> {
-      if (hasMarker(text)) {
-        const out: unknown[] = []
-        for (const seg of splitSegments(text)) {
-          if (seg.kind === "text") {
-            if (seg.text.trim()) out.push({ type: "text", text: seg.text })
-            continue
-          }
-          out.push(...mediaParts(seg.marker.ref, budget, caps))
+    function markerParts(text: string, budget: { left: number }, caps: readonly string[] | undefined): unknown[] {
+      const out: unknown[] = []
+      for (const seg of splitSegments(text)) {
+        if (seg.kind === "text") {
+          if (seg.text.trim()) out.push({ type: "text", text: seg.text })
+          continue
         }
-        return out.length ? out : [{ type: "text", text }]
+        out.push(...mediaParts(seg.marker.ref, budget, caps))
       }
-      const refs = await lookup(sessionID, text)
-      if (!refs) return undefined
-      return [{ type: "text", text }, ...refs.flatMap((ref) => mediaParts(ref, budget, caps))]
+      return out.length ? out : [{ type: "text", text }]
     }
 
     // ------------------------------------------------------------------
@@ -323,7 +338,9 @@ export default Plugin.define({
           keep.push(f)
           continue
         }
-        captured.push(ref)
+        // Snapshot the bytes now: the message stores what it admitted
+        // (OpenCode's image-attachment semantics), not a disk dependency.
+        captured.push(snapshot(ref))
         dbg("captured attachment", ref.mime, ref.name ?? ref.uri)
       }
       if (captured.length === 0) return
@@ -332,9 +349,9 @@ export default Plugin.define({
       // metadata (persisted as the user message's metadata).
       event.prompt.files = keep
       const key = `m/${sha(event.prompt.text)}`
-      for (const ref of captured) await record(event.sessionID, key, ref)
+      await record(event.sessionID, key, captured)
       const metadata = (event.metadata ?? {}) as Record<string, unknown>
-      const riding = refsFromMeta(metadata[META_KEY])
+      const riding = refsFromMetaValue(metadata[META_KEY])
       for (const ref of captured) if (!riding.some((r) => r.uri === ref.uri)) riding.push(ref)
       metadata[META_KEY] = riding
       event.metadata = metadata
@@ -384,7 +401,8 @@ export default Plugin.define({
             // is recorded against the note text for request-time injection, and
             // the result mirrors a text-file output to satisfy read's schema.
             const note = markerNote(ref)
-            await record(toolCtx.sessionID, `r/${sha(note)}`, ref)
+            const snap = snapshot(ref)
+            await record(toolCtx.sessionID, `r/${sha(note)}`, [snap])
             return {
               output: {
                 type: "file",
@@ -396,8 +414,9 @@ export default Plugin.define({
               },
               content: note,
               // The tool state persists this metadata (but not the file
-              // output), so the ref rides here for request-time injection.
-              metadata: { [META_KEY]: [ref] },
+              // output), so the snapshotted ref rides here for request-time
+              // injection.
+              metadata: { [META_KEY]: [snap] },
             }
           }
           const result = await original(input, toolCtx)
@@ -428,52 +447,110 @@ export default Plugin.define({
 
       const budget = { left: maxPerRequest }
       const caps = await inputCaps(event.model.providerID, event.model.id)
-      let changed = false
+      const map = await sessionMap(event.sessionID)
+
+      // Phase 1: collect every text slot that needs expansion (legacy markers
+      // or seam-registered media) WITHOUT touching the body, so slots sharing
+      // a seam key can be occurrence-counted before any of them resolves.
+      interface Slot {
+        text: string
+        /** Seam key, absent for legacy marker texts (which carry their refs). */
+        key?: string
+        /** Keep the slot's text alongside the media (joined fallback: media only). */
+        keepText: boolean
+        apply: (parts: unknown[]) => void
+      }
+      const slots: Slot[] = []
+      const expandable = (text: string) => hasMarker(text) || keyFor(map, text) !== undefined
 
       for (const msg of body.messages) {
         if (msg?.role !== "user" && msg?.role !== "tool") continue
         const content = msg.content
         if (typeof content === "string") {
-          const expanded = await expand(content, budget, event.sessionID, caps)
-          if (expanded) {
-            msg.content = expanded
-            changed = true
-          }
-        } else if (Array.isArray(content)) {
-          let matched = false
-          for (let i = 0; i < content.length; i++) {
-            const part = content[i] as { type?: string; text?: string } | string
-            const text = typeof part === "string" ? part : part?.type === "text" ? part.text : undefined
-            if (!text) continue
-            const expanded = await expand(text, budget, event.sessionID, caps)
-            if (!expanded) continue
-            content.splice(i, 1, ...expanded)
-            changed = true
-            matched = true
-            i += expanded.length - 1
-          }
-          // Text may be split across parts; fall back to joined matching and
-          // append the media parts at the end without touching any text.
-          if (!matched) {
-            const texts = content
-              .map((p) => (typeof p === "object" && p?.type === "text" ? (p.text as string) : undefined))
-              .filter((t): t is string => typeof t === "string")
-            for (const joiner of ["\n\n", "\n"]) {
-              if (texts.length < 2) break
-              const refs = await lookup(event.sessionID, texts.join(joiner))
-              if (refs) {
-                content.push(...refs.flatMap((ref) => mediaParts(ref, budget, caps)))
-                changed = true
-                break
-              }
-            }
-          }
+          if (!expandable(content)) continue
+          slots.push({
+            text: content,
+            key: hasMarker(content) ? undefined : keyFor(map, content),
+            keepText: true,
+            apply: (parts) => {
+              msg.content = parts
+            },
+          })
+          continue
+        }
+        if (!Array.isArray(content)) continue
+        const partSlots: Array<Slot & { index: number }> = []
+        for (let i = 0; i < content.length; i++) {
+          const part = content[i] as { type?: string; text?: string } | string
+          const text = typeof part === "string" ? part : part?.type === "text" ? part.text : undefined
+          if (!text || !expandable(text)) continue
+          const index = i
+          partSlots.push({
+            text,
+            index,
+            key: hasMarker(text) ? undefined : keyFor(map, text),
+            keepText: true,
+            apply: (parts) => {
+              content.splice(index, 1, ...parts)
+            },
+          })
+        }
+        if (partSlots.length > 0) {
+          slots.push(...partSlots)
+          continue
+        }
+        // Text may be split across parts; fall back to joined matching and
+        // append the media parts at the end without touching any text.
+        const texts = content
+          .map((p) => (typeof p === "object" && p?.type === "text" ? (p.text as string) : undefined))
+          .filter((t): t is string => typeof t === "string")
+        if (texts.length < 2) continue
+        for (const joiner of ["\n\n", "\n"]) {
+          const joined = texts.join(joiner)
+          const key = keyFor(map, joined)
+          if (!key) continue
+          slots.push({
+            text: joined,
+            key,
+            keepText: false,
+            apply: (parts) => {
+              content.push(...parts)
+            },
+          })
+          break
         }
       }
-      if (!changed) return
+      if (slots.length === 0) return
+
+      // Phase 2: resolve each slot against ITS MESSAGE's occurrence group
+      // (suffix-aligned — context truncation drops the oldest messages first),
+      // consuming the media budget in conversation order. This keeps a shared
+      // text hash from attaching one message's media to another message.
+      const occurrences = new Map<string, number>()
+      for (const slot of slots) if (slot.key) occurrences.set(slot.key, (occurrences.get(slot.key) ?? 0) + 1)
+      const seen = new Map<string, number>()
+      const resolved: Array<{ slot: Slot; parts: unknown[] }> = []
+      for (const slot of slots) {
+        let parts: unknown[]
+        if (!slot.key) {
+          parts = markerParts(slot.text, budget, caps)
+        } else {
+          const total = occurrences.get(slot.key) ?? 1
+          const index = seen.get(slot.key) ?? 0
+          seen.set(slot.key, index + 1)
+          const refs = pickGroup(map.get(slot.key) ?? [], index, total) ?? []
+          parts = refs.flatMap((ref) => mediaParts(ref, budget, caps))
+          if (slot.keepText) parts = [{ type: "text", text: slot.text }, ...parts]
+          else if (parts.length === 0) continue
+        }
+        resolved.push({ slot, parts })
+      }
+      if (resolved.length === 0) return
 
       dbg("rewriting body for", event.kind)
       try {
+        // Apply back-to-front so per-part splice indices stay valid.
+        for (const { slot, parts } of resolved.reverse()) slot.apply(parts)
         const headers = new Headers(req.headers)
         headers.delete("content-length")
         event.request = new Request(req, {
