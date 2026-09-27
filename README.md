@@ -62,6 +62,9 @@ are also loaded automatically:
 }
 ```
 
+Path-based loading resolves `index.ts` at the checkout root (a one-line re-export of
+`src/index.ts`, included in the package for exactly this purpose).
+
 ## Options
 
 ```jsonc

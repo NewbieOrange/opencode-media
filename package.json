@@ -16,6 +16,7 @@
     ".": "./src/index.ts"
   },
   "files": [
+    "index.ts",
     "src",
     "README.md",
     "CHANGELOG.md",
