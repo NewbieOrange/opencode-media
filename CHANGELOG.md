@@ -3,10 +3,10 @@
 ## Unreleased
 
 - **Adaptive `read` tool description**: when the active model's
-  `capabilities.input` supports audio/video (per `capabilityGate`), the `read`
-  tool description is extended per request to advertise media reading — naming
-  exactly the modalities that model supports and stating that media arrives as
-  perceivable native parts. Text-only models keep the stock description.
+  `capabilities.input` supports audio/video (per `capabilityGate`), a single
+  sentence is appended to the `read` tool description naming exactly the
+  supported modalities (e.g. "Also supports audio and video files."). Text-only
+  models keep the stock description.
 
 ## 0.1.0 — 2026-09-27
 

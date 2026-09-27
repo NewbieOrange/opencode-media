@@ -292,12 +292,7 @@ export default Plugin.define({
         const videoOk = shouldInject(caps, "video/mp4", capabilityGate)
         const kinds = [audioOk ? "audio" : undefined, videoOk ? "video" : undefined].filter(Boolean).join(" and ")
         if (kinds) {
-          readTool.description =
-            readTool.description +
-            `\n\nMedia support (opencode-media plugin): ${kinds} files are also supported. ` +
-            `Reading one attaches the real ${kinds.replaceAll(" and ", "/")} content to your messages ` +
-            `as native media parts (${partOpts.audio} / ${partOpts.video}) that your encoders perceive directly — ` +
-            `no transcription, waveform, or spectrogram analysis needed.`
+          readTool.description = `${readTool.description}\nAlso supports ${kinds} files.`
           dbg("read description extended for", event.model.id, kinds)
         }
       }
