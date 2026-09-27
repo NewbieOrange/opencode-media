@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-09-27
+
+- **Message-derived refs — plugin storage dropped**: the media ↔ message
+  association now lives in the messages themselves — user messages carry the
+  refs in their admission metadata (`metadata["opencode-media"]`), tool results
+  in their tool-state metadata (the tool state persists metadata but not the
+  file `output`, so the ref rides there). A per-session map is rebuilt from the
+  session's own messages on first touch, so injection still survives service
+  restarts, while forks, revert, and compaction now follow the message log for
+  free. Plugin storage is neither written nor read anymore (records left by
+  0.1.x are ignored). Behavior deltas: `r/` (read-tool) refs are no longer
+  shared across sessions (same-note-different-file collisions could inject the
+  wrong file before).
+- **System hint dropped**: the plugin no longer pushes a `MEDIA_SYSTEM_HINT`
+  system message coaching the model to trust its perception. Nothing is added
+  to the system prompt; hedging is the model's own behaviour now.
 - **Adaptive `read` tool description**: when the active model's
   `capabilities.input` supports audio/video (per `capabilityGate`), a single
   sentence is appended to the `read` tool description naming exactly the
